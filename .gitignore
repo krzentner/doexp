@@ -162,3 +162,4 @@ cython_debug/
 # doexp specific
 /data
 /data_tmp
+/venv*

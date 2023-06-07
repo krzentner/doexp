@@ -11,7 +11,8 @@ os.environ["DOEXP_PROJECT_ROOT"] = os.getcwd()
 
 # Set to the number of cpus by default
 # Likely should be set based on HOSTNAME
-# This flag affects
+# This flag affects slurm and skypilot as well.
+# When using those, you will probably want to override the default.
 GLOBAL_CONTEXT.max_concurrent_jobs = 1
 
 # Example of starting 10 expeirments

@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 import argparse
-import time
 import re
-from subprocess import run, PIPE
+from subprocess import run
 import sys
 import os
 
@@ -14,21 +13,20 @@ def parse_args():
 
 def main():
     args = parse_args()
+    _, file_path = os.path.split(args.task_file)
+    file_path = file_path.split('.')[0].replace('_', '')
+    cluster_name = f"sky-doexp-{file_path}"
     # Autostop after four hours, manually stop immediately once downloads are done
     launch_proc = run(
-            #["sky", "launch", "--yes", "--idle-minutes-to-autostop=240", args.task_file],
-            ["sky", "launch", "--yes", "--idle-minutes-to-autostop=20", "--down", args.task_file],
+            ["sky", "launch", "--yes", "--idle-minutes-to-autostop=240", "--down", "--cluster", cluster_name, args.task_file],
         capture_output=True, check=False, text=True)
     print(launch_proc.stdout)
+    #print(launch_proc.stdout, file=sys.stderr)
     print(launch_proc.stderr, file=sys.stderr)
     output = launch_proc.stdout
     job_return_codes_crashed = None
+    copy_output_failed = True
     try:
-        cluster_name = re.findall(r"To log into the head VM:.*ssh[^\s]* ([A-z0-9-]+)", output)
-        if cluster_name:
-            cluster_name = cluster_name[0]
-        else:
-            raise ValueError("Could not find cluster name")
         job_id = re.findall(r"Job submitted with Job ID: ([0-9]+)", output)
         job_return_codes_crashed = re.findall(r"Job [0-9]+ failed with return code list:.* \[([^0-9]+)", output)
         job_succeeded = "Job finished (status: SUCCEEDED)" in output
