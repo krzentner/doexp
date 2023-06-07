@@ -1,0 +1,25 @@
+resources:
+  cloud: gcp
+  instance_type: c2-standard-8
+  image_id: skypilot:cpu-debian-10
+
+num_nodes: 1  # Number of VMs to launch
+
+# Working directory (optional) containing the project codebase.
+# Its contents are synced to ~/sky_workdir/ on the cluster.
+#workdir: ~/doexp/
+
+# Commands to be run before executing the job.
+# Typical use: pip install -r requirements.txt, git clone, etc.
+setup: |
+  conda create -y -n doexp-py38 python=3.8
+  source activate doexp-py38
+  pip install -r requirements.txt
+
+# Commands to run as a job.
+# Typical use: launch the main program.
+run: |
+  source "$HOME/.profile"
+  source activate doexp-py38
+  mkdir data_tmp
+  {command}
