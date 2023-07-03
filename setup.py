@@ -6,5 +6,6 @@ setup(
     name='doexp',
     package_dir={'': 'src'},
     packages=find_packages(where='src'),
-    scripts=['scripts/doexp']
+    scripts=['scripts/doexp'],
+    install_requires=['psutil'],
     )
