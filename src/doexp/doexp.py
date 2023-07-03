@@ -426,7 +426,6 @@ class Context:
                 mb_per_core = int(math.ceil(1024 * cmd.ram_gb / cmd.cores))
             args = [
                 "srun",
-                f"--mem={ram_mb}M",
                 *core_args,
                 f"--mem-per-cpu={mb_per_core}M",
                 "--",
