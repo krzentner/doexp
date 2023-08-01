@@ -555,7 +555,7 @@ def parse_args():
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--use-skypilot", action="store_true")
     parser.add_argument("--use-slurm", action="store_true")
-    parser.add_argument("--no-use-slurm", dest="use_slurm", action="store_true")
+    parser.add_argument("--no-use-slurm", dest="use_slurm", action="store_false")
     parser.set_defaults(use_slurm=None)
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args()
