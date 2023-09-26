@@ -15,7 +15,7 @@ The simplest experiment runner KR could write.
 Install with:
 
 ```
-pip install git+https://github.com/krzentner/doexp.git@v0.1.1
+pip install git+https://github.com/krzentner/doexp.git@v0.1.2
 ```
 
 Copy the `example/exps.py` file into your project, and add experiments to it.
