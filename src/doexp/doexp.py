@@ -89,7 +89,7 @@ def printv(verbose, *args, **kwargs):
         print(*args, **kwargs)
 
 
-def get_cuda_gpus():
+def get_cuda_gpus() -> Tuple[str, ...]:
     visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", None)
     if visible_devices is None:
         try:
@@ -112,14 +112,14 @@ def get_cuda_gpus():
             return ()
 
 
-def get_cuda_vram(devices: List[int]):
+def get_cuda_vram(devices: List[str]):
     smi_proc = subprocess.run(
         ["nvidia-smi", "--query-gpu=gpu_name,index,memory.free", "--format=csv"],
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         check=False,
     )
-    mem_free_gb = [None for _ in devices]
+    mem_free_gb = [0. for _ in devices]
     output = smi_proc.stdout.decode("utf-8")
     for row in csv.DictReader(io.StringIO(output), delimiter=","):
         row = {k.strip(): v.strip() for (k, v) in row.items()}
@@ -129,9 +129,9 @@ def get_cuda_vram(devices: List[int]):
             print(f"{row['name']}: {free_mib} free")
             free_gb = int(free_mib.split(" ")[0]) / 1024
             mem_free_gb[i] = free_gb
-    if None in mem_free_gb:
-        i = mem_free_gb.index(None)
-        print(f"Could not get free memory for GPU {devices[i]}")
+    for i, val in enumerate(mem_free_gb):
+        if val == 0.:
+            print(f"Could not get free memory for GPU {devices[i]}")
     return mem_free_gb
 
 
@@ -212,7 +212,7 @@ def _filter_cmds_gpu_ram(
             out_commands.add(cmd)
         elif cmd.gpus and all(resv == 0.0 for resv in gpu_ram_reserved):
             out_commands.add(cmd)
-        elif cmd.gpus is None and min(gpu_ram_free) >= cmd.gpu_ram_gb:
+        elif cmd.gpus is None and min(gpu_ram_free, default=0.) >= cmd.gpu_ram_gb:
             out_commands.add(cmd)
         else:
             printv(verbose, "Not enough gpu ram free to run:", cmd)
@@ -344,10 +344,7 @@ class Context:
             print(f"Using GPUS: {self._cuda_devices}")
             self.gpu_ram_cap = get_cuda_vram(self._cuda_devices)
             self.gpu_ram_reserved = [0.0 for _ in self.gpu_ram_cap]
-            # Make sure we're trying to put jobs on the largest GPU
-            max_gpu_ram = max(self.gpu_ram_cap)
-            while self.gpu_ram_cap[self.next_cuda_device] < max_gpu_ram:
-                self.next_cuda_device += 1
+            self._choose_next_cuda_device()
         done = False
         while not done:
             ready_cmds, done = self._refresh_commands(args.expfile, args.dry_run)
@@ -364,6 +361,22 @@ class Context:
                 time.sleep(0.2)
             self._process_completed(completed)
 
+    def _choose_next_cuda_device(self):
+        if self.gpu_ram_cap:
+            # Find gpu with most ram free, cycling in case all utilization is
+            # equal
+            gpu_ram_free = [
+                cap - reserved
+                for (cap, reserved) in zip(self.gpu_ram_cap, self.gpu_ram_reserved)
+            ]
+            max_free = max(gpu_ram_free)
+            while True:
+                self.next_cuda_device = (self.next_cuda_device + 1) % len(
+                    self._cuda_devices
+                )
+                if gpu_ram_free[self.next_cuda_device] >= max_free:
+                    break
+
     def _ready(self):
         """Checks global readiness conditions."""
         if (
@@ -379,6 +392,7 @@ class Context:
         """Reloads, filters, and sorts the commands"""
         old_commands = self.commands
         self.commands = set()
+        content = ""
         try:
             with open(filename) as f:
                 content = f.read()
@@ -392,7 +406,7 @@ class Context:
                     print(f"Error in exps.py (line {line_num}):")
                     print(exc)
                     print(">>", content.split("\n")[line_num - 1])
-                except AttributeError:
+                except (AttributeError, IndexError):
                     print(exc)
                 self.commands = old_commands
         if dry_run:
@@ -480,7 +494,6 @@ class Context:
     def _run_process(self, cmd, *, stdout, stderr):
         args = _cmd_to_args(cmd, self.data_dir, self._tmp_data_dir)
         env = os.environ.copy()
-        max_ram_gb = 0.0
         cuda_devices = []
         for k, v in cmd.env:
             env[k] = v
@@ -495,27 +508,12 @@ class Context:
             for i, cap in enumerate(self.gpu_ram_cap):
                 self.gpu_ram_reserved[i] = cap
             cuda_devices = list(range(len(self.gpu_ram_cap)))
-            max_ram_gb = cmd.ram_gb
-        else:
+        elif self._cuda_devices:
             env["CUDA_VISIBLE_DEVICES"] = str(self._cuda_devices[self.next_cuda_device])
             self.gpu_ram_reserved[self.next_cuda_device] += cmd.gpu_ram_gb
             cuda_devices = [self.next_cuda_device]
 
-            # Find gpu with most ram free, cycling in case all utilization is
-            # equal
-            gpu_ram_free = [
-                cap - reserved
-                for (cap, reserved) in zip(self.gpu_ram_cap, self.gpu_ram_reserved)
-            ]
-            max_free = max(gpu_ram_free)
-            while True:
-                self.next_cuda_device = (self.next_cuda_device + 1) % len(
-                    self._cuda_devices
-                )
-                if gpu_ram_free[self.next_cuda_device] >= max_free:
-                    break
-
-            max_ram_gb = cmd.ram_gb
+            self._choose_next_cuda_device()
 
         print(" ".join(shlex.quote(arg) for arg in args))
         proc = subprocess.Popen(args, stdout=stdout, stderr=stderr, env=env)
