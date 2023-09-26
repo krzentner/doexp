@@ -1,6 +1,6 @@
 [project]
 name = "doexp"
-version = "0.1.1"
+version = "0.1.2-dev"
 description = "A simple experiment runner"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -60,6 +60,6 @@ venv = ".venv"
 
 [tool.poetry]
 name = "doexp"
-version = "0.1.0"
+version = "0.1.2-dev"
 description = ""
 authors = ["K.R. Zentner <krzentner@gmail.com>"]

@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 # See https://github.com/krzentner/doexp
 from dataclasses import dataclass, field, replace
-from typing import Union, List, Tuple, Optional
+from typing import Union, List, Tuple, Optional, Set, Any, Dict
 import os
 import re
 import subprocess
-import psutil
 import time
 import shutil
 import math
@@ -13,6 +12,10 @@ import sys
 import argparse
 import shlex
 import tempfile
+import csv
+import io
+
+import psutil
 
 
 @dataclass(frozen=True)
@@ -32,16 +35,24 @@ class Out(FileArg):
 
 @dataclass(frozen=True)
 class Cmd:
-
-    args: tuple
-    extra_outputs: tuple
-    extra_inputs: tuple
+    args: Tuple[Union[str, FileArg], ...]
+    extra_outputs: Tuple[Out, ...]
+    extra_inputs: Tuple[In, ...]
     warmup_time: float = 1.0
     ram_gb: float = 4.0
     priority: Union[int, Tuple[int, ...]] = 10
     gpus: Union[str, None] = None
+    gpu_ram_gb: float = 0.0
     cores: Optional[int] = None
     skypilot_template: Optional[str] = None
+    env: Tuple[Tuple[str, str], ...] = ()
+
+    def __post_init__(self):
+        assert (
+            self.gpus is None or self.gpu_ram_gb == 0.0
+        ), "Only gpus or gpu_ram_gb should be passed"
+        assert all([isinstance(input, In) for input in self.extra_inputs])
+        assert all([isinstance(output, Out) for output in self.extra_outputs])
 
     def __str__(self):
         args = _cmd_to_args(self, "data", "tmp_data")
@@ -58,7 +69,20 @@ class Cmd:
             return self.cores
 
 
+@dataclass
+class Process:
+    cmd: Cmd
+    proc: subprocess.Popen
+
+    # Needed to update gpu_ram_reserved
+    cuda_devices: List[int]
+
+    # Will be increased if process exceeds amount specified in cmd
+    max_ram_gb: float
+
+
 _BYTES_PER_GB = (1024) ** 3
+
 
 def printv(verbose, *args, **kwargs):
     if verbose:
@@ -69,13 +93,13 @@ def get_cuda_gpus():
     visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", None)
     if visible_devices is None:
         try:
-            _nvidia_smi_proc = subprocess.run(
+            smi_proc = subprocess.run(
                 ["nvidia-smi", "--list-gpus"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
                 check=False,
             )
-            output = _nvidia_smi_proc.stdout.decode("utf-8")
+            output = smi_proc.stdout.decode("utf-8")
             return tuple(re.findall(r"GPU ([0-9]*):", output))
         except FileNotFoundError:
             return ()
@@ -88,6 +112,29 @@ def get_cuda_gpus():
             return ()
 
 
+def get_cuda_vram(devices: List[int]):
+    smi_proc = subprocess.run(
+        ["nvidia-smi", "--query-gpu=gpu_name,index,memory.free", "--format=csv"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    mem_free_gb = [None for _ in devices]
+    output = smi_proc.stdout.decode("utf-8")
+    for row in csv.DictReader(io.StringIO(output), delimiter=","):
+        row = {k.strip(): v.strip() for (k, v) in row.items()}
+        if row["index"] in devices:
+            i = devices.index(row["index"])
+            free_mib = row["memory.free [MiB]"]
+            print(f"{row['name']}: {free_mib} free")
+            free_gb = int(free_mib.split(" ")[0]) / 1024
+            mem_free_gb[i] = free_gb
+    if None in mem_free_gb:
+        i = mem_free_gb.index(None)
+        print(f"Could not get free memory for GPU {devices[i]}")
+    return mem_free_gb
+
+
 def _ram_in_use_gb():
     vm = psutil.virtual_memory()
     return (vm.total - vm.available) / _BYTES_PER_GB
@@ -96,11 +143,16 @@ def _ram_in_use_gb():
 def _filter_cmds_remaining(commands, data_dir):
     out_commands = set()
     for cmd in commands:
+        found_out = False
         for arg in cmd.args + cmd.extra_outputs:
+            if isinstance(arg, Out):
+                found_out = True
             if isinstance(arg, Out) and not os.path.exists(
                 os.path.join(data_dir, arg.filename)
             ):
                 out_commands.add(cmd)
+        if not found_out:
+            print("No outputs for command:", str(cmd))
     return out_commands
 
 
@@ -132,7 +184,9 @@ def _filter_cmds_ram(commands, *, reserved_ram_gb, ram_gb_cap, use_skypilot, ver
     return out_commands
 
 
-def _filter_cmds_cores(commands, *, reserved_cores, max_core_alloc, use_skypilot, verbose):
+def _filter_cmds_cores(
+    commands, *, reserved_cores, max_core_alloc, use_skypilot, verbose
+):
     out_commands = set()
     for cmd in commands:
         cores = cmd._cores_as_int()
@@ -142,6 +196,26 @@ def _filter_cmds_cores(commands, *, reserved_cores, max_core_alloc, use_skypilot
             out_commands.add(cmd)
         else:
             printv(verbose, "Not enough cores free to run:", cmd)
+    return out_commands
+
+
+def _filter_cmds_gpu_ram(
+    commands, *, gpu_ram_reserved, gpu_ram_cap, use_skypilot, verbose
+):
+    out_commands = set()
+    gpu_ram_free = [
+        cap - reserved
+        for (cap, reserved) in zip(gpu_ram_cap, gpu_ram_reserved)
+    ]
+    for cmd in commands:
+        if use_skypilot and cmd.skypilot_template:
+            out_commands.add(cmd)
+        elif cmd.gpus and all(resv == 0.0 for resv in gpu_ram_reserved):
+            out_commands.add(cmd)
+        elif cmd.gpus is None and min(gpu_ram_free) >= cmd.gpu_ram_gb:
+            out_commands.add(cmd)
+        else:
+            printv(verbose, "Not enough gpu ram free to run:", cmd)
     return out_commands
 
 
@@ -174,8 +248,8 @@ def _cmd_to_args(cmd, data_dir, tmp_data_dir):
 
 def _filter_completed(running):
     for p in running:
-        p[1].poll()
-    completed = [p for p in running if p[1].returncode is not None]
+        p.proc.poll()
+    completed = [p for p in running if p.proc.returncode is not None]
     now_running = [p for p in running if p not in completed]
     assert len(completed) + len(now_running) == len(running)
     return now_running, completed
@@ -188,7 +262,7 @@ def _cmd_name(cmd):
             args.append(arg.filename)
         else:
             args.append(str(arg))
-    name = " ".join(args).replace("/", ":")
+    name = " ".join(args).replace("/", "\u2571")
     if len(name) > 200:
         name = name[:200]
     return name
@@ -196,9 +270,8 @@ def _cmd_name(cmd):
 
 @dataclass
 class Context:
-
-    commands: set = field(default_factory=set)
-    running: list = field(default_factory=list)
+    commands: Set[Cmd] = field(default_factory=set)
+    running: List[Process] = field(default_factory=list)
     data_dir: str = f"{os.getcwd()}/data"
     temporary_data_dir: Optional[str] = None
     verbose: bool = False
@@ -218,6 +291,8 @@ class Context:
     last_commands_remaining: int = -1
     next_cuda_device: int = 0
     _cuda_devices: List[str] = get_cuda_gpus()
+    gpu_ram_cap: List[float] = field(default_factory=list)
+    gpu_ram_reserved: List[float] = field(default_factory=list)
 
     # External runner fields
     srun_availabe: bool = bool(shutil.which("srun"))
@@ -267,6 +342,12 @@ class Context:
             return
         elif not self.use_slurm:
             print(f"Using GPUS: {self._cuda_devices}")
+            self.gpu_ram_cap = get_cuda_vram(self._cuda_devices)
+            self.gpu_ram_reserved = [0.0 for _ in self.gpu_ram_cap]
+            # Make sure we're trying to put jobs on the largest GPU
+            max_gpu_ram = max(self.gpu_ram_cap)
+            while self.gpu_ram_cap[self.next_cuda_device] < max_gpu_ram:
+                self.next_cuda_device += 1
         done = False
         while not done:
             ready_cmds, done = self._refresh_commands(args.expfile, args.dry_run)
@@ -337,7 +418,7 @@ class Context:
             for cmd in needs_output:
                 print(str(cmd))
         if self.use_slurm:
-            fits_in_ram = has_inputs
+            fits_in_gpu = has_inputs
         else:
             fits_in_ram = _filter_cmds_ram(
                 has_inputs,
@@ -346,8 +427,16 @@ class Context:
                 use_skypilot=self.use_skypilot,
                 verbose=self.verbose_now,
             )
+            fits_in_gpu = _filter_cmds_gpu_ram(
+                fits_in_ram,
+                gpu_ram_reserved=self.gpu_ram_reserved,
+                gpu_ram_cap=self.gpu_ram_cap,
+                use_skypilot=self.use_skypilot,
+                verbose=self.verbose_now,
+            )
+
         fits_in_core_alloc = _filter_cmds_cores(
-            fits_in_ram,
+            fits_in_gpu,
             reserved_cores=self.reserved_cores,
             max_core_alloc=self.max_core_alloc,
             use_skypilot=self.use_skypilot,
@@ -361,8 +450,8 @@ class Context:
         out_commands = set()
         for cmd in commands:
             running = False
-            for (running_cmd, proc) in self.running:
-                if cmd == running_cmd:
+            for process in self.running:
+                if cmd == process.cmd:
                     running = True
                     break
             if not running:
@@ -378,108 +467,147 @@ class Context:
         stdout = open(os.path.join(cmd_dir, "stdout.txt"), "w")
         stderr = open(os.path.join(cmd_dir, "stderr.txt"), "w")
         # print(cmd.to_shell(self.data_dir))
-        proc = self._run_process(
+        process = self._run_process(
             cmd,
             stdout=stdout,
             stderr=stderr,
         )
-        print(proc.pid)
+        print(process.proc.pid)
         self.warmup_deadline = time.monotonic() + cmd.warmup_time
-        self.running.append((cmd, proc))
-        return proc
+        self.running.append(process)
+        return process
 
     def _run_process(self, cmd, *, stdout, stderr):
         args = _cmd_to_args(cmd, self.data_dir, self._tmp_data_dir)
         env = os.environ.copy()
+        max_ram_gb = 0.0
+        cuda_devices = []
+        for k, v in cmd.env:
+            env[k] = v
         if self.use_skypilot and cmd.skypilot_template:
-            tmp_dir_rel_path = os.path.relpath(self._tmp_data_dir, os.getcwd())
-            data_dir_rel_path = os.path.relpath(self.data_dir, os.getcwd())
-            args_rel = _cmd_to_args(cmd, data_dir_rel_path, tmp_dir_rel_path)
-            command = " ".join([shlex.quote(arg) for arg in args_rel])
-            with open(cmd.skypilot_template) as f:
-                template_content = f.read()
-            skypilot_yaml = template_content.format(command=command)
-            skypilot_file = tempfile.NamedTemporaryFile(
-                "w", suffix=".yaml", delete=False
-            )
-            skypilot_file.write(skypilot_yaml)
-            skypilot_file.close()
-            args = [
-                "python",
-                "-m",
-                "doexp.skypilot_wrapper",
-                "--task-file",
-                skypilot_file.name,
-            ]
-            for arg in cmd.args:
-                if isinstance(arg, (Out, FileArg)) and not isinstance(arg, In):
-                    args.append("--out-file")
-                    f_path = os.path.join(tmp_dir_rel_path, arg.filename)
-                    args.append(f_path)
+            args = self._skypilot_args(cmd)
         elif self.use_slurm:
-            ram_mb = int(math.ceil(1024 * cmd.ram_gb))
-            if not cmd.cores:
-                core_args = ()
-                mb_per_core = int(1024 * cmd.ram_gb)
-            else:
-                core_args = (f"--cpus-per-task={cmd.cores}",)
-                mb_per_core = int(math.ceil(1024 * cmd.ram_gb / cmd.cores))
-            args = [
-                "srun",
-                *core_args,
-                f"--mem-per-cpu={mb_per_core}M",
-                "--",
-            ] + args
+            args = self._slurm_args(cmd, args)
         elif cmd.gpus is not None:
             env["CUDA_VISIBLE_DEVICES"] = cmd.gpus
-        elif len(self._cuda_devices) > 1:
+            # The meaning of indices in cmd.gpus could be different from doexp
+            # internal indices, so reserve all gpus.
+            for i, cap in enumerate(self.gpu_ram_cap):
+                self.gpu_ram_reserved[i] = cap
+            cuda_devices = list(range(len(self.gpu_ram_cap)))
+            max_ram_gb = cmd.ram_gb
+        else:
             env["CUDA_VISIBLE_DEVICES"] = str(self._cuda_devices[self.next_cuda_device])
-            self.next_cuda_device = (self.next_cuda_device + 1) % len(
-                self._cuda_devices
-            )
-        print(" ".join(args))
-        return subprocess.Popen(args, stdout=stdout, stderr=stderr, env=env)
+            self.gpu_ram_reserved[self.next_cuda_device] += cmd.gpu_ram_gb
+            cuda_devices = [self.next_cuda_device]
+
+            # Find gpu with most ram free, cycling in case all utilization is
+            # equal
+            gpu_ram_free = [
+                cap - reserved
+                for (cap, reserved) in zip(self.gpu_ram_cap, self.gpu_ram_reserved)
+            ]
+            max_free = max(gpu_ram_free)
+            while True:
+                self.next_cuda_device = (self.next_cuda_device + 1) % len(
+                    self._cuda_devices
+                )
+                if gpu_ram_free[self.next_cuda_device] >= max_free:
+                    break
+
+            max_ram_gb = cmd.ram_gb
+
+        print(" ".join(shlex.quote(arg) for arg in args))
+        proc = subprocess.Popen(args, stdout=stdout, stderr=stderr, env=env)
+        return Process(cmd=cmd, proc=proc, cuda_devices=cuda_devices, max_ram_gb=cmd.ram_gb)
+
+    def _skypilot_args(self, cmd):
+        tmp_dir_rel_path = os.path.relpath(self._tmp_data_dir, os.getcwd())
+        data_dir_rel_path = os.path.relpath(self.data_dir, os.getcwd())
+        args_rel = _cmd_to_args(cmd, data_dir_rel_path, tmp_dir_rel_path)
+        command = " ".join([shlex.quote(arg) for arg in args_rel])
+        with open(cmd.skypilot_template) as f:
+            template_content = f.read()
+        skypilot_yaml = template_content.format(command=command)
+        skypilot_file = tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False)
+        skypilot_file.write(skypilot_yaml)
+        skypilot_file.close()
+        args = [
+            "python",
+            "-m",
+            "doexp.skypilot_wrapper",
+            "--task-file",
+            skypilot_file.name,
+        ]
+        for arg in cmd.args:
+            if isinstance(arg, (Out, FileArg)) and not isinstance(arg, In):
+                args.append("--out-file")
+                f_path = os.path.join(tmp_dir_rel_path, arg.filename)
+                args.append(f_path)
+        return args
+
+    def _slurm_args(self, cmd, args):
+        ram_mb = int(math.ceil(1024 * cmd.ram_gb))
+        if not cmd.cores:
+            core_args = ()
+            mb_per_core = int(1024 * cmd.ram_gb)
+        else:
+            core_args = (f"--cpus-per-task={cmd.cores}",)
+            mb_per_core = int(math.ceil(1024 * cmd.ram_gb / cmd.cores))
+        args = [
+            "srun",
+            *core_args,
+            f"--mem-per-cpu={mb_per_core}M",
+            "--",
+        ] + args
+        return args
 
     def _terminate_if_oom(self):
         """Terminates processes if over ram cap"""
         gb_free = self.ram_gb_cap - _ram_in_use_gb()
 
-        def total_time(cmd_proc):
-            cmd, proc = cmd_proc
-            times = psutil.Process(proc.pid).cpu_times()
-            return (
-                times.user + times.system + times.children_user + times.children_system
-            )
+        def total_time(process):
+            try:
+                times = psutil.Process(process.proc.pid).cpu_times()
+                return (
+                    times.user + times.system + times.children_user + times.children_system
+                )
+            except (psutil.NoSuchProcess, psutil.ZombieProcess):
+                return float('inf')
 
         by_total_time = sorted(self.running, key=total_time)
-        for (running_cmd, proc) in by_total_time:
+        for process in by_total_time:
             try:
-                mem = psutil.Process(proc.pid).memory_full_info()
-            except psutil.ZombieProcess:
+                mem = psutil.Process(process.proc.pid).memory_full_info()
+            except (psutil.NoSuchProcess, psutil.ZombieProcess):
                 continue
-            ram_gb = (mem.pss + mem.uss) / _BYTES_PER_GB
-            if ram_gb > running_cmd.ram_gb:
+            ram_gb = (getattr(mem, 'pss', 0) + mem.uss) / _BYTES_PER_GB
+            if ram_gb > process.cmd.ram_gb:
                 print(
                     f"Command exceeded memory limit "
-                    f"({ram_gb} > {running_cmd.ram_gb}): "
-                    f"{_cmd_name(running_cmd)}"
+                    f"({ram_gb} > {process.cmd.ram_gb}): "
+                    f"{_cmd_name(process.cmd)}"
                 )
-                self.reserved_ram_gb -= running_cmd.ram_gb
-                # Can't assign fields on Cmd's, since they're frozen
-                self.running.remove((running_cmd, proc))
-                self.running.append((replace(running_cmd, ram_gb=ram_gb), proc))
-                self.reserved_ram_gb += running_cmd.ram_gb
+                self.reserved_ram_gb -= process.max_ram_gb
+                process.max_ram_gb = ram_gb
+                self.reserved_ram_gb += process.max_ram_gb
             if gb_free < 0:
-                print(f"Terminating process: {_cmd_name(running_cmd)}")
-                proc.terminate()
+                print(f"Terminating process: {_cmd_name(process.cmd)}")
+                process.proc.terminate()
                 gb_free += ram_gb
 
     def _process_completed(self, completed):
         """Copy outputs from the tmp dir if the process exited successfully"""
-        for (cmd, proc) in completed:
+        for process in completed:
+            cmd = process.cmd
             self.reserved_ram_gb -= cmd.ram_gb
             self.reserved_cores -= cmd._cores_as_int()
-            if proc.returncode != 0:
+            for cuda_dev in process.cuda_devices:
+                if cmd.gpus:
+                    self.gpu_ram_reserved[cuda_dev] = 0
+                else:
+                    self.gpu_ram_reserved[cuda_dev] -= cmd.gpu_ram_gb
+            if process.proc.returncode != 0:
                 print(f"Error running {str(cmd)}")
                 cmd_dir = os.path.join(self._tmp_data_dir, "pipes", _cmd_name(cmd))
                 with open(os.path.join(cmd_dir, "stderr.txt")) as f:
@@ -511,10 +639,12 @@ def cmd(
     ram_gb: float = 4,
     cores: Optional[int] = None,
     warmup_time: float = 1.0,
-    extra_outputs=tuple(),
-    extra_inputs=tuple(),
+    extra_outputs: Union[List[Union[str, Out]], Tuple[Union[str, Out], ...]] = tuple(),
+    extra_inputs: Union[List[Union[str, In]], Tuple[Union[str, In], ...]] = tuple(),
     gpus: Union[str, None] = None,
+    gpu_ram_gb: float = 0.0,
     skypilot_template: Optional[str] = None,
+    env: Dict[str, Any] = None,
 ) -> None:
     """Add a command to be run by the GLOBAL_CONTEXT.
 
@@ -526,22 +656,37 @@ def cmd(
         - `extra_outputs`: a tuple of `Out` files that will be created by the command, but which are not present in the arguments.
         - `extra_inputs`: a tuple of `In` files required by the command, but which are not present in the arguments. Often used to emulate globbing.
         - `gpus`: an optional string declaring which gpus the command should have access to. If not passed, `CUDA_VISIBLE_DEVICES` will be used to assign GPUs in a round-robin fashion.
+        - `gpu_ram_gb`: A number of GiB of GPU VRAM required. Must not be passed with `gpus` (which override this option).
         - `skypilot_template`: a path to a skypilot yaml file that contains a replacement sequence `{command}` in it. A command must specify a `skypilot_template` to use skypilot, and one skypilot cluster will be created using the template per command. See `examples/skypilot_template.yaml` for an example.
+        - `env`: Overrides to the environment variables.
 
     """
     if isinstance(priority, list):
         priority = tuple(priority)
+
+    extra_outputs = tuple(
+        [output if isinstance(output, Out) else Out(output) for output in extra_outputs]
+    )
+    extra_inputs = tuple(
+        [input if isinstance(input, In) else In(input) for input in extra_inputs]
+    )
+    if env is None:
+        env = ()
+    else:
+        env = tuple([(str(k), str(v)) for (k, v) in env.items()])
     GLOBAL_CONTEXT.cmd(
         Cmd(
             args=tuple(args),
-            extra_outputs=tuple(extra_outputs),
-            extra_inputs=tuple(extra_inputs),
+            extra_outputs=extra_outputs,
+            extra_inputs=extra_inputs,
             warmup_time=warmup_time,
             ram_gb=ram_gb,
             priority=priority,
             gpus=gpus,
+            gpu_ram_gb=gpu_ram_gb,
             cores=cores,
             skypilot_template=skypilot_template,
+            env=env,
         )
     )
 
