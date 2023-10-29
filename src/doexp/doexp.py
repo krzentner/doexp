@@ -119,7 +119,7 @@ def get_cuda_vram(devices: List[str]):
         stderr=subprocess.DEVNULL,
         check=False,
     )
-    mem_free_gb = [0. for _ in devices]
+    mem_free_gb = [0.0 for _ in devices]
     output = smi_proc.stdout.decode("utf-8")
     for row in csv.DictReader(io.StringIO(output), delimiter=","):
         row = {k.strip(): v.strip() for (k, v) in row.items()}
@@ -130,7 +130,7 @@ def get_cuda_vram(devices: List[str]):
             free_gb = int(free_mib.split(" ")[0]) / 1024
             mem_free_gb[i] = free_gb
     for i, val in enumerate(mem_free_gb):
-        if val == 0.:
+        if val == 0.0:
             print(f"Could not get free memory for GPU {devices[i]}")
     return mem_free_gb
 
@@ -213,15 +213,14 @@ def _filter_cmds_gpu_ram(
 ):
     out_commands = set()
     gpu_ram_free = [
-        cap - reserved
-        for (cap, reserved) in zip(gpu_ram_cap, gpu_ram_reserved)
+        cap - reserved for (cap, reserved) in zip(gpu_ram_cap, gpu_ram_reserved)
     ]
     for cmd in commands:
         if use_skypilot and cmd.skypilot_template:
             out_commands.add(cmd)
         elif cmd.gpus and all(resv == 0.0 for resv in gpu_ram_reserved):
             out_commands.add(cmd)
-        elif cmd.gpus is None and min(gpu_ram_free, default=0.) >= cmd.gpu_ram_gb:
+        elif cmd.gpus is None and min(gpu_ram_free, default=0.0) >= cmd.gpu_ram_gb:
             out_commands.add(cmd)
         else:
             printv(verbose, "Not enough gpu ram free to run:", cmd)
@@ -526,7 +525,9 @@ class Context:
 
         print(" ".join(shlex.quote(arg) for arg in args))
         proc = subprocess.Popen(args, stdout=stdout, stderr=stderr, env=env)
-        return Process(cmd=cmd, proc=proc, cuda_devices=cuda_devices, max_ram_gb=cmd.ram_gb)
+        return Process(
+            cmd=cmd, proc=proc, cuda_devices=cuda_devices, max_ram_gb=cmd.ram_gb
+        )
 
     def _skypilot_args(self, cmd):
         tmp_dir_rel_path = os.path.relpath(self._tmp_data_dir, os.getcwd())
@@ -577,10 +578,13 @@ class Context:
             try:
                 times = psutil.Process(process.proc.pid).cpu_times()
                 return (
-                    times.user + times.system + times.children_user + times.children_system
+                    times.user
+                    + times.system
+                    + times.children_user
+                    + times.children_system
                 )
             except (psutil.NoSuchProcess, psutil.ZombieProcess):
-                return float('inf')
+                return float("inf")
 
         by_total_time = sorted(self.running, key=total_time)
         for process in by_total_time:
@@ -588,7 +592,7 @@ class Context:
                 mem = psutil.Process(process.proc.pid).memory_full_info()
             except (psutil.NoSuchProcess, psutil.ZombieProcess):
                 continue
-            ram_gb = (getattr(mem, 'pss', 0) + mem.uss) / _BYTES_PER_GB
+            ram_gb = (getattr(mem, "pss", 0) + mem.uss) / _BYTES_PER_GB
             if ram_gb > process.cmd.ram_gb:
                 print(
                     f"Command exceeded memory limit "
