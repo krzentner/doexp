@@ -137,7 +137,16 @@ def get_cuda_vram(devices: List[str]):
 
 def _ram_in_use_gb():
     vm = psutil.virtual_memory()
-    return (vm.total - vm.available) / _BYTES_PER_GB
+    available = vm.available
+    unix_available = (
+        getattr(vm, "cached", 0)
+        + getattr(vm, "buffers", 0)
+        + getattr(vm, "inactive", 0)
+    )
+    available = max(available, unix_available)
+    # print(f"{available/_BYTES_PER_GB:.1f}GiB of RAM available")
+    used_bytes = vm.total - available
+    return used_bytes / _BYTES_PER_GB
 
 
 def _filter_cmds_remaining(commands, data_dir):
