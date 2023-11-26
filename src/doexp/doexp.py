@@ -2,6 +2,7 @@
 # See https://github.com/krzentner/doexp
 from dataclasses import dataclass, field, replace
 from typing import Union, List, Tuple, Optional, Set, Any, Dict
+from pprint import pprint
 import os
 import re
 import subprocess
@@ -31,6 +32,11 @@ class In(FileArg):
 @dataclass(frozen=True)
 class Out(FileArg):
     pass
+
+
+@dataclass(frozen=True)
+class TmpIn(In):
+    """Class to represent depending on a file existing in the temp directory."""
 
 
 @dataclass(frozen=True)
@@ -67,6 +73,17 @@ class Cmd:
             return 1
         else:
             return self.cores
+
+    def all_outputs(self) -> List[Out]:
+        outs = []
+        for arg in self.args:
+            if isinstance(arg, Out):
+                outs.append(arg)
+        for output in self.extra_outputs:
+            if not isinstance(output, Out):
+                output = Out(output)
+            outs.append(output)
+        return outs
 
 
 @dataclass
@@ -149,33 +166,48 @@ def _ram_in_use_gb():
     return used_bytes / _BYTES_PER_GB
 
 
-def _filter_cmds_remaining(commands, data_dir):
+def _filter_cmds_remaining(commands, data_dir, in_progress_paths):
     out_commands = set()
     for cmd in commands:
+        found_overwrite = []
         found_out = False
-        for arg in cmd.args + cmd.extra_outputs:
+        for arg in cmd.all_outputs():
             if isinstance(arg, Out):
                 found_out = True
-            if isinstance(arg, Out) and not os.path.exists(
-                os.path.join(data_dir, arg.filename)
+                if arg.filename in in_progress_paths or os.path.exists(
+                    os.path.join(data_dir, arg.filename)
+                ):
+                    found_overwrite.append(arg)
+            if (
+                isinstance(arg, Out)
+                and not os.path.exists(os.path.join(data_dir, arg.filename))
+                and arg.filename not in in_progress_paths
             ):
                 out_commands.add(cmd)
+                if found_overwrite:
+                    print("Command will overwrite files:", str(cmd))
+                    pprint(found_overwrite)
         if not found_out:
             print("No outputs for command:", str(cmd))
     return out_commands
 
 
-def _filter_cmds_ready(commands, data_dir, verbose):
+def _filter_cmds_ready(commands, data_dir, data_tmp, verbose):
     out_commands = set()
     for cmd in commands:
         ready = True
         for arg in cmd.args + cmd.extra_inputs:
-            if isinstance(arg, In) and not os.path.exists(
-                os.path.join(data_dir, arg.filename)
-            ):
-                ready = False
-                printv(verbose, "Waiting on input:", arg.filename)
-                break
+            if isinstance(arg, In):
+                if isinstance(arg, TmpIn) and not os.path.exists(
+                    os.path.join(data_tmp, arg.filename)
+                ):
+                    ready = False
+                    printv(verbose, "Waiting on temp file:", arg.filename)
+                    break
+                elif not os.path.exists(os.path.join(data_dir, arg.filename)):
+                    ready = False
+                    printv(verbose, "Waiting on input:", arg.filename)
+                    break
         if ready:
             out_commands.add(cmd)
     return out_commands
@@ -266,7 +298,7 @@ def _filter_completed(running):
 def _cmd_name(cmd):
     args = []
     for arg in cmd.args:
-        if isinstance(arg, (In, Out)):
+        if isinstance(arg, FileArg):
             args.append(arg.filename)
         else:
             args.append(str(arg))
@@ -433,8 +465,16 @@ class Context:
 
     def _filter_commands(self, commands):
         """Filters the commands to find only those that are ready to run"""
-        needs_output = _filter_cmds_remaining(commands, self.data_dir)
-        has_inputs = _filter_cmds_ready(needs_output, self.data_dir, self.verbose_now)
+        in_progress_paths = set()
+        for proc in self.running:
+            for out in proc.cmd.all_outputs():
+                in_progress_paths.add(out.filename)
+        needs_output = _filter_cmds_remaining(
+            commands, self.data_dir, in_progress_paths
+        )
+        has_inputs = _filter_cmds_ready(
+            needs_output, self.data_dir, self._tmp_data_dir, self.verbose_now
+        )
         if needs_output and not has_inputs:
             print("Commands exist without any way to acquire inputs:")
             for cmd in needs_output:
@@ -625,7 +665,7 @@ class Context:
                     print(f.read())
             else:
                 print(f"Command complete: {str(cmd)}")
-                for arg in cmd.args + cmd.extra_outputs:
+                for arg in cmd.all_outputs():
                     if isinstance(arg, Out):
                         tmp = os.path.join(self._tmp_data_dir, arg.filename)
                         final = os.path.join(self.data_dir, arg.filename)
