@@ -71,6 +71,11 @@ They are as follows:
   - `extra_inputs`: a tuple of `In` files required by the command, but which are not present in the arguments. Often used to emulate globbing.
   - `gpus`: an optional string declaring which gpus the command should have access to. If not passed, `CUDA_VISIBLE_DEVICES` will be used to assign GPUs in a round-robin fashion.
   - `skypilot_template`: a path to a skypilot yaml file that contains a replacement sequence `{command}` in it. A command must specify a `skypilot_template` to use skypilot, and one skypilot cluster will be created using the template per command. See `examples/skypilot_template.yaml` for an example.
+  - `env`: Overrides to environment variables for this command. Useful for
+    passing arguments into notebooks.
+  - `always_local`: Even when using slurm or skypilot, run this command
+    locally. Useful for commands that generate config files or report results
+    into sqlite databases.
 
 ## FAQ:
 

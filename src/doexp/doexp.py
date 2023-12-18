@@ -52,6 +52,7 @@ class Cmd:
     cores: Optional[int] = None
     skypilot_template: Optional[str] = None
     env: Tuple[Tuple[str, str], ...] = ()
+    always_local: bool = False
 
     def __post_init__(self):
         assert (
@@ -216,12 +217,17 @@ def _filter_cmds_ready(commands, data_dir, data_tmp, verbose):
 def _filter_cmds_ram(commands, *, reserved_ram_gb, ram_gb_cap, use_skypilot, verbose):
     out_commands = set()
     for cmd in commands:
+        expected_ram_use = max(reserved_ram_gb, _ram_in_use_gb()) + cmd.ram_gb
         if use_skypilot and cmd.skypilot_template:
             out_commands.add(cmd)
-        elif max(reserved_ram_gb, _ram_in_use_gb()) + cmd.ram_gb <= ram_gb_cap:
+        elif expected_ram_use <= ram_gb_cap:
             out_commands.add(cmd)
         else:
-            printv(verbose, "Not enough ram free to run:", cmd)
+            printv(verbose, f"Not enough ram free to run: {cmd}")
+            printv(
+                verbose,
+                f"Expected RAM usage exceeds cap: ({expected_ram_use:.1f}GiB > {ram_gb_cap:.1f}GiB)",
+            )
     return out_commands
 
 
@@ -381,10 +387,13 @@ class Context:
             print("srun is not available, cannot use slurm")
             return
         elif not self.use_slurm:
-            print(f"Using GPUS: {self._cuda_devices}")
-            self.gpu_ram_cap = get_cuda_vram(self._cuda_devices)
-            self.gpu_ram_reserved = [0.0 for _ in self.gpu_ram_cap]
-            self._choose_next_cuda_device()
+            if self._cuda_devices:
+                print(f"Using GPUS: {self._cuda_devices}")
+                self.gpu_ram_cap = get_cuda_vram(self._cuda_devices)
+                self.gpu_ram_reserved = [0.0 for _ in self.gpu_ram_cap]
+                self._choose_next_cuda_device()
+            else:
+                print("No CUDA devices found")
         done = False
         while not done:
             ready_cmds, done = self._refresh_commands(args.expfile, args.dry_run)
@@ -475,7 +484,7 @@ class Context:
         has_inputs = _filter_cmds_ready(
             needs_output, self.data_dir, self._tmp_data_dir, self.verbose_now
         )
-        if needs_output and not has_inputs:
+        if needs_output and not has_inputs and not self.running:
             print("Commands exist without any way to acquire inputs:")
             for cmd in needs_output:
                 print(str(cmd))
@@ -545,9 +554,9 @@ class Context:
         cuda_devices = []
         for k, v in cmd.env:
             env[k] = v
-        if self.use_skypilot and cmd.skypilot_template:
+        if self.use_skypilot and cmd.skypilot_template and not cmd.always_local:
             args = self._skypilot_args(cmd)
-        elif self.use_slurm:
+        elif self.use_slurm and not cmd.always_local:
             args = self._slurm_args(cmd, args)
         elif cmd.gpus is not None:
             env["CUDA_VISIBLE_DEVICES"] = cmd.gpus
@@ -695,7 +704,8 @@ def cmd(
     gpus: Union[str, None] = None,
     gpu_ram_gb: float = 0.0,
     skypilot_template: Optional[str] = None,
-    env: Dict[str, Any] = None,
+    env: Optional[Dict[str, Any]] = None,
+    always_local: bool = False,
 ) -> None:
     """Add a command to be run by the GLOBAL_CONTEXT.
 
@@ -709,7 +719,11 @@ def cmd(
         - `gpus`: an optional string declaring which gpus the command should have access to. If not passed, `CUDA_VISIBLE_DEVICES` will be used to assign GPUs in a round-robin fashion.
         - `gpu_ram_gb`: A number of GiB of GPU VRAM required. Must not be passed with `gpus` (which override this option).
         - `skypilot_template`: a path to a skypilot yaml file that contains a replacement sequence `{command}` in it. A command must specify a `skypilot_template` to use skypilot, and one skypilot cluster will be created using the template per command. See `examples/skypilot_template.yaml` for an example.
-        - `env`: Overrides to the environment variables.
+        - `env`: Overrides to environment variables for this command. Useful for
+            passing arguments into notebooks.
+        - `always_local`: Even when using slurm or skypilot, run this command
+            locally. Useful for commands that generate config files or report results
+            into sqlite databases.
 
     """
     if isinstance(priority, list):
