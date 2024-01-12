@@ -21,6 +21,18 @@ import psutil
 
 @dataclass(frozen=True)
 class FileArg:
+    '''File path argument to a command.
+    Will be prefixed with 'data' or 'data_tmp' (unless overriden).
+    Instead of using this type directly, usually the subtypes are used to
+    indicate dependencies / outputs:
+        - Use the Out type to indicate an output path
+        - Use In to indicate an input path.
+        - Use TmpIn to indicate a dependency on a (possibly incomplete) output
+          of another command.
+        - Use FileArg to indicate an input that should be prefixed with the
+          data_tmp directory, but which does not need to exist for the command
+          to be run. Frequently used for indicating globs or other patterns.
+    '''
     filename: str
 
 
@@ -37,6 +49,21 @@ class Out(FileArg):
 @dataclass(frozen=True)
 class TmpIn(In):
     """Class to represent depending on a file existing in the temp directory."""
+
+
+def expand_filearg(arg, data_dir, data_tmp_dir):
+    '''Expands an input argument, which may be a FileArg, into a path.'''
+    if not isinstance(arg, FileArg):
+        return arg
+    elif isinstance(arg, In):
+        if isinstance(arg, TmpIn):
+            return os.path.join(data_tmp_dir, arg.filename)
+        else:
+            return os.path.join(data_dir, arg.filename)
+    elif isinstance(arg, Out):
+        return os.path.join(data_tmp_dir, arg.filename)
+    else:
+        return os.path.join(data_tmp_dir, arg.filename)
 
 
 @dataclass(frozen=True)
@@ -84,6 +111,9 @@ class Cmd:
             if not isinstance(output, Out):
                 output = Out(output)
             outs.append(output)
+        for (_, v) in self.env:
+            if isinstance(v, Out):
+                outs.append(v)
         return outs
 
 
@@ -193,22 +223,16 @@ def _filter_cmds_remaining(commands, data_dir, in_progress_paths):
     return out_commands
 
 
-def _filter_cmds_ready(commands, data_dir, data_tmp, verbose):
+def _filter_cmds_ready(commands, data_dir, data_tmp_dir, verbose):
     out_commands = set()
     for cmd in commands:
         ready = True
-        for arg in cmd.args + cmd.extra_inputs:
-            if isinstance(arg, In):
-                if isinstance(arg, TmpIn) and not os.path.exists(
-                    os.path.join(data_tmp, arg.filename)
-                ):
-                    ready = False
-                    printv(verbose, "Waiting on temp file:", arg.filename)
-                    break
-                elif not os.path.exists(os.path.join(data_dir, arg.filename)):
-                    ready = False
-                    printv(verbose, "Waiting on input:", arg.filename)
-                    break
+        for arg in cmd.args + cmd.extra_inputs + tuple([pair[1] for pair in cmd.env]):
+            arg_path = expand_filearg(arg, data_dir, data_tmp_dir)
+            if isinstance(arg, In) and not os.path.exists(arg_path):
+                ready = False
+                printv(verbose, "Waiting on input:", arg_path)
+                break
         if ready:
             out_commands.add(cmd)
     return out_commands
@@ -275,32 +299,23 @@ def _sort_cmds(commands):
 
     return sorted(list(commands), key=key)
 
-def create_paths(cmd, data_dir, tmp_data_dir):
+def create_paths(cmd, tmp_data_dir, verbose):
     print('Creating paths')
     for arg in cmd.args:
-        if isinstance(arg, In):
-            d = os.path.join(data_dir, arg.filename)
-            if not os.path.exists(d):
-                print(f'Missing In file {d}')
-        elif isinstance(arg, (Out, FileArg)):
+        if isinstance(arg, (Out, FileArg)):
             # Use temporary directory here
             d = os.path.join(tmp_data_dir, arg.filename)
             extra = None
             while not extra:
                 d, extra = os.path.split(d)
-            print(f"Creating directory ({d}) for Out file ({arg.filename}).")
+            printv(verbose, f"Creating directory ({d}) for Out file ({arg.filename}).")
             os.makedirs(d, exist_ok=True)
 
 
 def _cmd_to_args(cmd, data_dir, tmp_data_dir):
     args = []
     for arg in cmd.args:
-        if isinstance(arg, In):
-            arg = os.path.join(data_dir, arg.filename)
-        elif isinstance(arg, (Out, FileArg)):
-            # Use temporary directory here
-            arg = os.path.join(tmp_data_dir, arg.filename)
-        args.append(str(arg))
+        args.append(str(expand_filearg(arg, data_dir, tmp_data_dir)))
     return args
 
 
@@ -561,11 +576,11 @@ class Context:
 
     def _run_process(self, cmd, *, stdout, stderr):
         args = _cmd_to_args(cmd, self.data_dir, self._tmp_data_dir)
-        create_paths(cmd, self.data_dir, self._tmp_data_dir)
+        create_paths(cmd, self._tmp_data_dir, self.verbose_now)
         env = os.environ.copy()
         cuda_devices = []
         for k, v in cmd.env:
-            env[k] = v
+            env[k] = expand_filearg(v, self.data_dir, self._tmp_data_dir)
         if self.use_skypilot and cmd.skypilot_template and not cmd.always_local:
             args = self._skypilot_args(cmd)
         elif self.use_slurm and not cmd.always_local:
