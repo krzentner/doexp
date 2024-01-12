@@ -2,6 +2,7 @@
 # See https://github.com/krzentner/doexp
 from dataclasses import dataclass, field, replace
 from typing import Union, List, Tuple, Optional, Set, Any, Dict
+from pprint import pprint
 import os
 import re
 import subprocess
@@ -34,6 +35,11 @@ class Out(FileArg):
 
 
 @dataclass(frozen=True)
+class TmpIn(In):
+    """Class to represent depending on a file existing in the temp directory."""
+
+
+@dataclass(frozen=True)
 class Cmd:
     args: Tuple[Union[str, FileArg], ...]
     extra_outputs: Tuple[Out, ...]
@@ -46,6 +52,7 @@ class Cmd:
     cores: Optional[int] = None
     skypilot_template: Optional[str] = None
     env: Tuple[Tuple[str, str], ...] = ()
+    always_local: bool = False
 
     def __post_init__(self):
         assert (
@@ -67,6 +74,17 @@ class Cmd:
             return 1
         else:
             return self.cores
+
+    def all_outputs(self) -> List[Out]:
+        outs = []
+        for arg in self.args:
+            if isinstance(arg, Out):
+                outs.append(arg)
+        for output in self.extra_outputs:
+            if not isinstance(output, Out):
+                output = Out(output)
+            outs.append(output)
+        return outs
 
 
 @dataclass
@@ -119,7 +137,7 @@ def get_cuda_vram(devices: List[str]):
         stderr=subprocess.DEVNULL,
         check=False,
     )
-    mem_free_gb = [0. for _ in devices]
+    mem_free_gb = [0.0 for _ in devices]
     output = smi_proc.stdout.decode("utf-8")
     for row in csv.DictReader(io.StringIO(output), delimiter=","):
         row = {k.strip(): v.strip() for (k, v) in row.items()}
@@ -130,43 +148,67 @@ def get_cuda_vram(devices: List[str]):
             free_gb = int(free_mib.split(" ")[0]) / 1024
             mem_free_gb[i] = free_gb
     for i, val in enumerate(mem_free_gb):
-        if val == 0.:
+        if val == 0.0:
             print(f"Could not get free memory for GPU {devices[i]}")
     return mem_free_gb
 
 
 def _ram_in_use_gb():
     vm = psutil.virtual_memory()
-    return (vm.total - vm.available) / _BYTES_PER_GB
+    available = vm.available
+    unix_available = (
+        getattr(vm, "cached", 0)
+        + getattr(vm, "buffers", 0)
+        + getattr(vm, "inactive", 0)
+    )
+    available = max(available, unix_available)
+    # print(f"{available/_BYTES_PER_GB:.1f}GiB of RAM available")
+    used_bytes = vm.total - available
+    return used_bytes / _BYTES_PER_GB
 
 
-def _filter_cmds_remaining(commands, data_dir):
+def _filter_cmds_remaining(commands, data_dir, in_progress_paths):
     out_commands = set()
     for cmd in commands:
+        found_overwrite = []
         found_out = False
-        for arg in cmd.args + cmd.extra_outputs:
+        for arg in cmd.all_outputs():
             if isinstance(arg, Out):
                 found_out = True
-            if isinstance(arg, Out) and not os.path.exists(
-                os.path.join(data_dir, arg.filename)
+                if arg.filename in in_progress_paths or os.path.exists(
+                    os.path.join(data_dir, arg.filename)
+                ):
+                    found_overwrite.append(arg)
+            if (
+                isinstance(arg, Out)
+                and not os.path.exists(os.path.join(data_dir, arg.filename))
+                and arg.filename not in in_progress_paths
             ):
                 out_commands.add(cmd)
+                if found_overwrite:
+                    print("Command will overwrite files:", str(cmd))
+                    pprint(found_overwrite)
         if not found_out:
             print("No outputs for command:", str(cmd))
     return out_commands
 
 
-def _filter_cmds_ready(commands, data_dir, verbose):
+def _filter_cmds_ready(commands, data_dir, data_tmp, verbose):
     out_commands = set()
     for cmd in commands:
         ready = True
         for arg in cmd.args + cmd.extra_inputs:
-            if isinstance(arg, In) and not os.path.exists(
-                os.path.join(data_dir, arg.filename)
-            ):
-                ready = False
-                printv(verbose, "Waiting on input:", arg.filename)
-                break
+            if isinstance(arg, In):
+                if isinstance(arg, TmpIn) and not os.path.exists(
+                    os.path.join(data_tmp, arg.filename)
+                ):
+                    ready = False
+                    printv(verbose, "Waiting on temp file:", arg.filename)
+                    break
+                elif not os.path.exists(os.path.join(data_dir, arg.filename)):
+                    ready = False
+                    printv(verbose, "Waiting on input:", arg.filename)
+                    break
         if ready:
             out_commands.add(cmd)
     return out_commands
@@ -175,12 +217,17 @@ def _filter_cmds_ready(commands, data_dir, verbose):
 def _filter_cmds_ram(commands, *, reserved_ram_gb, ram_gb_cap, use_skypilot, verbose):
     out_commands = set()
     for cmd in commands:
+        expected_ram_use = max(reserved_ram_gb, _ram_in_use_gb()) + cmd.ram_gb
         if use_skypilot and cmd.skypilot_template:
             out_commands.add(cmd)
-        elif max(reserved_ram_gb, _ram_in_use_gb()) + cmd.ram_gb <= ram_gb_cap:
+        elif expected_ram_use <= ram_gb_cap:
             out_commands.add(cmd)
         else:
-            printv(verbose, "Not enough ram free to run:", cmd)
+            printv(verbose, f"Not enough ram free to run: {cmd}")
+            printv(
+                verbose,
+                f"Expected RAM usage exceeds cap: ({expected_ram_use:.1f}GiB > {ram_gb_cap:.1f}GiB)",
+            )
     return out_commands
 
 
@@ -204,15 +251,14 @@ def _filter_cmds_gpu_ram(
 ):
     out_commands = set()
     gpu_ram_free = [
-        cap - reserved
-        for (cap, reserved) in zip(gpu_ram_cap, gpu_ram_reserved)
+        cap - reserved for (cap, reserved) in zip(gpu_ram_cap, gpu_ram_reserved)
     ]
     for cmd in commands:
         if use_skypilot and cmd.skypilot_template:
             out_commands.add(cmd)
         elif cmd.gpus and all(resv == 0.0 for resv in gpu_ram_reserved):
             out_commands.add(cmd)
-        elif cmd.gpus is None and min(gpu_ram_free, default=0.) >= cmd.gpu_ram_gb:
+        elif cmd.gpus is None and min(gpu_ram_free, default=0.0) >= cmd.gpu_ram_gb:
             out_commands.add(cmd)
         else:
             printv(verbose, "Not enough gpu ram free to run:", cmd)
@@ -258,7 +304,7 @@ def _filter_completed(running):
 def _cmd_name(cmd):
     args = []
     for arg in cmd.args:
-        if isinstance(arg, (In, Out)):
+        if isinstance(arg, FileArg):
             args.append(arg.filename)
         else:
             args.append(str(arg))
@@ -341,10 +387,13 @@ class Context:
             print("srun is not available, cannot use slurm")
             return
         elif not self.use_slurm:
-            print(f"Using GPUS: {self._cuda_devices}")
-            self.gpu_ram_cap = get_cuda_vram(self._cuda_devices)
-            self.gpu_ram_reserved = [0.0 for _ in self.gpu_ram_cap]
-            self._choose_next_cuda_device()
+            if self._cuda_devices:
+                print(f"Using GPUS: {self._cuda_devices}")
+                self.gpu_ram_cap = get_cuda_vram(self._cuda_devices)
+                self.gpu_ram_reserved = [0.0 for _ in self.gpu_ram_cap]
+                self._choose_next_cuda_device()
+            else:
+                print("No CUDA devices found")
         done = False
         while not done:
             ready_cmds, done = self._refresh_commands(args.expfile, args.dry_run)
@@ -425,9 +474,17 @@ class Context:
 
     def _filter_commands(self, commands):
         """Filters the commands to find only those that are ready to run"""
-        needs_output = _filter_cmds_remaining(commands, self.data_dir)
-        has_inputs = _filter_cmds_ready(needs_output, self.data_dir, self.verbose_now)
-        if needs_output and not has_inputs:
+        in_progress_paths = set()
+        for proc in self.running:
+            for out in proc.cmd.all_outputs():
+                in_progress_paths.add(out.filename)
+        needs_output = _filter_cmds_remaining(
+            commands, self.data_dir, in_progress_paths
+        )
+        has_inputs = _filter_cmds_ready(
+            needs_output, self.data_dir, self._tmp_data_dir, self.verbose_now
+        )
+        if needs_output and not has_inputs and not self.running:
             print("Commands exist without any way to acquire inputs:")
             for cmd in needs_output:
                 print(str(cmd))
@@ -497,9 +554,9 @@ class Context:
         cuda_devices = []
         for k, v in cmd.env:
             env[k] = v
-        if self.use_skypilot and cmd.skypilot_template:
+        if self.use_skypilot and cmd.skypilot_template and not cmd.always_local:
             args = self._skypilot_args(cmd)
-        elif self.use_slurm:
+        elif self.use_slurm and not cmd.always_local:
             args = self._slurm_args(cmd, args)
         elif cmd.gpus is not None:
             env["CUDA_VISIBLE_DEVICES"] = cmd.gpus
@@ -517,7 +574,9 @@ class Context:
 
         print(" ".join(shlex.quote(arg) for arg in args))
         proc = subprocess.Popen(args, stdout=stdout, stderr=stderr, env=env)
-        return Process(cmd=cmd, proc=proc, cuda_devices=cuda_devices, max_ram_gb=cmd.ram_gb)
+        return Process(
+            cmd=cmd, proc=proc, cuda_devices=cuda_devices, max_ram_gb=cmd.ram_gb
+        )
 
     def _skypilot_args(self, cmd):
         tmp_dir_rel_path = os.path.relpath(self._tmp_data_dir, os.getcwd())
@@ -568,10 +627,13 @@ class Context:
             try:
                 times = psutil.Process(process.proc.pid).cpu_times()
                 return (
-                    times.user + times.system + times.children_user + times.children_system
+                    times.user
+                    + times.system
+                    + times.children_user
+                    + times.children_system
                 )
             except (psutil.NoSuchProcess, psutil.ZombieProcess):
-                return float('inf')
+                return float("inf")
 
         by_total_time = sorted(self.running, key=total_time)
         for process in by_total_time:
@@ -579,7 +641,7 @@ class Context:
                 mem = psutil.Process(process.proc.pid).memory_full_info()
             except (psutil.NoSuchProcess, psutil.ZombieProcess):
                 continue
-            ram_gb = (getattr(mem, 'pss', 0) + mem.uss) / _BYTES_PER_GB
+            ram_gb = (getattr(mem, "pss", 0) + mem.uss) / _BYTES_PER_GB
             if ram_gb > process.cmd.ram_gb:
                 print(
                     f"Command exceeded memory limit "
@@ -612,7 +674,7 @@ class Context:
                     print(f.read())
             else:
                 print(f"Command complete: {str(cmd)}")
-                for arg in cmd.args + cmd.extra_outputs:
+                for arg in cmd.all_outputs():
                     if isinstance(arg, Out):
                         tmp = os.path.join(self._tmp_data_dir, arg.filename)
                         final = os.path.join(self.data_dir, arg.filename)
@@ -642,7 +704,8 @@ def cmd(
     gpus: Union[str, None] = None,
     gpu_ram_gb: float = 0.0,
     skypilot_template: Optional[str] = None,
-    env: Dict[str, Any] = None,
+    env: Optional[Dict[str, Any]] = None,
+    always_local: bool = False,
 ) -> None:
     """Add a command to be run by the GLOBAL_CONTEXT.
 
@@ -656,7 +719,11 @@ def cmd(
         - `gpus`: an optional string declaring which gpus the command should have access to. If not passed, `CUDA_VISIBLE_DEVICES` will be used to assign GPUs in a round-robin fashion.
         - `gpu_ram_gb`: A number of GiB of GPU VRAM required. Must not be passed with `gpus` (which override this option).
         - `skypilot_template`: a path to a skypilot yaml file that contains a replacement sequence `{command}` in it. A command must specify a `skypilot_template` to use skypilot, and one skypilot cluster will be created using the template per command. See `examples/skypilot_template.yaml` for an example.
-        - `env`: Overrides to the environment variables.
+        - `env`: Overrides to environment variables for this command. Useful for
+            passing arguments into notebooks.
+        - `always_local`: Even when using slurm or skypilot, run this command
+            locally. Useful for commands that generate config files or report results
+            into sqlite databases.
 
     """
     if isinstance(priority, list):
